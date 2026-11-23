@@ -113,25 +113,58 @@ RECIPIENTS.forEach(r => {
 });
 setTo(to);
 
-// ---- online indicator: reads the heartbeats the laptops send to <topic>-status ----
-const online = {};
-async function checkOnline() {
-  await Promise.all(RECIPIENTS.map(async (r) => {
-    try {
-      const res = await fetch(NTFY + encodeURIComponent(topic + "-status") +
-        "/json?poll=1&since=150s&tags=" + encodeURIComponent(r.id));
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const txt = await res.text();
-      online[r.id] = txt.split("\n").some(l => { try { return JSON.parse(l).event === "message"; } catch (e) { return false; } });
-    } catch (e) { online[r.id] = undefined; }
-    const dot = document.getElementById("dot-" + r.id);
-    if (dot) dot.className = "dot" + (online[r.id] === true ? " up" : online[r.id] === false ? " down" : "");
-  }));
+// ---- online indicator: ping / pong on <topic>-status ----
+// While this app is open it sends a "ping"; every running computer answers "pong".
+// (No constant heartbeat: ntfy.sh allows only 250 sent messages per day per home IP.)
+const PING_EVERY = 180000;  // re-check every 3 min while the app is on screen
+const PING_MIN_GAP = 60000; // never ping more than once a minute when reopening the app
+const PONG_WAIT = 10000;    // no answer within 10 s -> red dot
+const online = {};          // true = green, false = red, undefined = grey (unknown)
+const lastPong = {};
+let lastPing = 0;
+
+function paintDot(id) {
+  const dot = document.getElementById("dot-" + id);
+  if (dot) dot.className = "dot" + (online[id] === true ? " up" : online[id] === false ? " down" : "");
 }
+
+async function sendPing(force) {
+  if (document.hidden) return;
+  const now = Date.now();
+  if (!force && now - lastPing < PING_MIN_GAP) return;
+  lastPing = now;
+  try {
+    const r = await fetch(NTFY + encodeURIComponent(topic + "-status"), {
+      method: "POST", headers: { "Tags": "ping" }, body: "ping"
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+  } catch (e) {
+    RECIPIENTS.forEach(r => { online[r.id] = undefined; paintDot(r.id); });
+    return;
+  }
+  setTimeout(() => {
+    RECIPIENTS.forEach(r => {
+      if (!(lastPong[r.id] >= now)) { online[r.id] = false; paintDot(r.id); }
+    });
+  }, PONG_WAIT);
+}
+
 if (topic && who) {
-  checkOnline();
-  setInterval(checkOnline, 30000);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) checkOnline(); });
+  const st = new EventSource(NTFY + encodeURIComponent(topic + "-status") + "/sse?tags=pong");
+  st.onopen = () => sendPing(false);  // first ping once we are listening for answers
+  st.onmessage = (e) => {
+    try {
+      const m = JSON.parse(e.data);
+      if (m.event !== "message") return;
+      const rec = RECIPIENTS.find(r => (m.tags || []).includes(r.id));
+      if (!rec) return;
+      lastPong[rec.id] = Date.now();
+      online[rec.id] = true;
+      paintDot(rec.id);
+    } catch (err) {}
+  };
+  setInterval(() => sendPing(true), PING_EVERY);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) sendPing(false); });
 }
 
 // ---- replies: the computers answer on <topic>-reply-<mom|dad>, so only this phone gets them ----
@@ -193,6 +226,10 @@ async function sendMessage(text) {
       headers: { "Title": who, "Tags": to },
       body: text
     });
+    if (r.status === 429) {
+      show("Dzienny limit wiadomości ntfy w tej sieci się wyczerpał. Przełącz telefon na dane komórkowe.", "err");
+      return false;
+    }
     if (!r.ok) throw new Error("HTTP " + r.status);
     const label = RECIPIENTS.find(x => x.id === to).label;
     if (online[to] === false) show("Wysłano do: " + label + ", ale komputer wygląda na wyłączony", "err");
